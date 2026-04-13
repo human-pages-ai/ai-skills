@@ -25,6 +25,34 @@ argument-hint: "[path to .sol file] [--thorough] [--include-backend <path>] [--f
 
 You are an orchestrator that runs a structured adversarial security audit on a Solidity smart contract. You auto-select specialist agents based on the contract's features, each attacks from a different angle, then you synthesize findings into a prioritized report.
 
+## When to Use
+
+- Pre-deployment security review of Solidity contracts
+- Evaluating a contract's security posture before integrating with it
+- Auditing forks/modifications of known protocols
+- Finding vulnerabilities in CTF challenges or audit contests
+
+## When NOT to Use
+
+- **Non-Solidity contracts** — this skill is Solidity-focused. For Rust/Move/Cairo, adapt manually.
+- **Formal verification needs** — if you need mathematical proof of correctness, use Certora, Halmos, or KEVM instead. This skill finds bugs, it doesn't prove absence of bugs.
+- **Already professionally audited + unchanged** — if the code was audited by a reputable firm and hasn't changed, run a differential review instead of a full audit.
+- **Gas optimization only** — this is a security audit, not a gas audit.
+
+## Rationalizations to Reject
+
+If you catch yourself thinking any of these during the audit, stop and investigate deeper.
+
+| Rationalization | Why It's Wrong | Required Action |
+|---|---|---|
+| "This is standard OpenZeppelin, it's safe" | OpenZeppelin versions have CVEs. Constructor args and overrides can break guarantees. | Check the exact OZ version and how it's configured |
+| "Solidity 0.8 prevents overflows" | `unchecked` blocks, casting between int sizes, and `abi.decode` bypass SafeMath | Grep for `unchecked`, explicit casts, and assembly |
+| "The contract is small, so it's probably safe" | Small contracts compose into large attack surfaces. Simple code has simple bugs. | Audit it fully — small contracts get the same process |
+| "nonReentrant is present, reentrancy is covered" | Cross-function and cross-contract reentrancy bypass single-function guards | Map ALL shared state across functions |
+| "This is an admin function, trust assumptions apply" | Admin key compromise is a real threat model. Admin functions need review too. | Assess admin powers and what a compromised key can do |
+| "The tests pass, so the logic is correct" | Tests verify intended behavior. Audits verify unintended behavior. | Ignore test results when evaluating security |
+| "This pattern looks safe" | Pattern recognition is not analysis. Context determines safety. | Trace the full data flow before concluding |
+
 ## Input
 
 The contract to audit is: $ARGUMENTS
@@ -59,6 +87,49 @@ Distill this into a **Contract Brief** that every agent receives. Include:
 - Known accepted risks (so agents don't re-report them)
 - Deployment parameters
 
+### Step 0.1: Entry-Point Analysis
+
+Before selecting specialist agents, **map the complete attack surface**. Spawn one agent to produce a structured entry-point table covering ALL contracts in scope.
+
+For every contract file, identify all **state-changing** entry points (external/public functions that are NOT view/pure). Classify each:
+
+| Classification | Description |
+|---|---|
+| **Public (Unrestricted)** | Callable by any EOA or contract with no access restriction |
+| **Role-Restricted** | Gated by onlyOwner, onlyAdmin, hasRole, require(msg.sender == X), etc. |
+| **Contract-Only** | Callbacks, interface hooks, functions that check tx.origin != msg.sender |
+| **Review Required** | Ambiguous access control (dynamic trust lists, conditional restrictions) |
+
+Output format per contract:
+```
+| Function | File:Line | Access | Classification |
+|----------|-----------|--------|----------------|
+```
+
+**Why this matters**: This prevents scoping gaps. Every public unrestricted entry point is a potential attack vector. If a contract in scope isn't in this table, it's been missed.
+
+Add the entry-point table to the Contract Brief.
+
+### Step 0.2: Invariant Extraction
+
+For each core function (deposit, withdraw, claim, transfer, state transitions), document **explicit invariants** — conditions that must ALWAYS hold before and after the function executes.
+
+Format:
+```
+INV-1: [invariant statement]
+  - Relied on by: [which functions assume this]
+  - Violated if: [what would break it]
+```
+
+Minimum 3 invariants per core function. Examples:
+- "totalStaked == sum of all userInfo[x].amount"
+- "After deposit, user.rewardDebt == user.amount * accRewardPerShare / PRECISION"
+- "No user can hold shares on both sides of a triple simultaneously"
+
+**Why this matters**: Specialist agents check whether these invariants can be violated. This turns bug-finding from "look for known patterns" into "prove this property can break." The VotingEscrow underflow (Intuition, $XX loss) would have been caught by documenting "INV: _supply_at requires point.ts <= t" and checking whether all callers guarantee it.
+
+Add the invariant list to the Contract Brief.
+
 ### Step 0.5: Auto-select agents
 
 Based on the Contract Brief, select which agents to run. Default is 5-7 agents. Use all 11 only if `--thorough` is passed.
@@ -90,18 +161,36 @@ If `--focus` is passed, run only the named agents regardless of auto-selection.
 
 ## Step 1: Pre-flight checks
 
-### 1a. Static analysis (Slither)
+### 1a. Static analysis (Slither + Semgrep)
 
-Check if Slither is available. **Never auto-install.**
+Check if Slither and Semgrep are available. **Never auto-install.**
 
 ```bash
 which slither 2>/dev/null
+which semgrep 2>/dev/null
 ```
 
+**Slither:**
 - If available: run `slither src/ --filter-paths "lib/|node_modules/" 2>&1 || true` and capture output.
-- If not available: print `"Slither not found — static analysis skipped. Install with: pipx install slither-analyzer"` and continue without it. Pass "Slither: not available" to agents.
+- If not available: print `"Slither not found — install with: pipx install slither-analyzer"` and continue.
 
-### 1b. Foundry check
+**Semgrep:**
+- If available: run `semgrep --config p/solidity-security src/ 2>&1 || true` and capture output.
+- If not available: print `"Semgrep not found — install with: pipx install semgrep"` and continue.
+
+Pass tool outputs (or "not available" notes) to agents.
+
+### 1b. Dependency version check
+
+Check OpenZeppelin and other dependency versions for known CVEs:
+
+```bash
+cat lib/openzeppelin-contracts/package.json 2>/dev/null | grep version || cat node_modules/@openzeppelin/contracts/package.json 2>/dev/null | grep version || echo "OZ version not found"
+```
+
+Flag if OZ version is below 4.9.3 (known reentrancy guard bug) or below 5.0.0 (if contract uses 5.x patterns). Check `foundry.toml` or `remappings.txt` for pinned dependency versions.
+
+### 1c. Foundry check
 
 Verify the project compiles:
 
@@ -126,225 +215,35 @@ Every agent MUST:
 - Ground findings in specific line numbers and function names
 - Rate each finding: CRITICAL / HIGH / MEDIUM / LOW / INFO
 - Provide a concrete exploit scenario or proof that it's not exploitable
+- Check the entry-point table — focus on Public (Unrestricted) entry points first, they're the primary attack surface
+- Check the invariant list — can any invariant be violated through your attack angle?
 - Keep response to 200-400 words
 - Not report known accepted risks unless they found a new angle
 
 ---
 
-### Agent 1: SWC Registry Scanner
+### Agent Playbooks
 
-**Role**: Systematically check every SWC entry against the contract.
+Each agent receives its specific playbook from [references/agent-playbooks.md](references/agent-playbooks.md). The playbook defines the agent's role, attack vectors to check, and instructions.
 
-**Playbook** (check these SWC IDs):
-- SWC-100: Function default visibility
-- SWC-101: Integer overflow/underflow (Solidity >=0.8 has built-in checks, but verify unchecked blocks)
-- SWC-102: Outdated compiler version
-- SWC-103: Floating pragma
-- SWC-104: Unchecked call return value
-- SWC-105: Unprotected ether withdrawal
-- SWC-106: Unprotected selfdestruct
-- SWC-107: Reentrancy (basic check — Agent 3 goes deeper)
-- SWC-108: State variable default visibility
-- SWC-110: Assert violation / improper use
-- SWC-111: Deprecated functions
-- SWC-112: Delegatecall to untrusted callee
-- SWC-113: DoS with failed call
-- SWC-114: Transaction order dependence (front-running)
-- SWC-115: Authorization through tx.origin
-- SWC-116: Block values as time proxy
-- SWC-118: Incorrect constructor name
-- SWC-119: Shadowing state variables
-- SWC-120: Weak randomness
-- SWC-124: Write to arbitrary storage
-- SWC-125: Incorrect inheritance order
-- SWC-127: Arbitrary jump with function type variable
-- SWC-128: DoS with block gas limit
-- SWC-129: Typographical error (=+ vs +=)
-- SWC-130: Right-to-left override control character
-- SWC-131: Presence of unused variables
-- SWC-132: Unexpected ether balance
-- SWC-134: Message call with hardcoded gas amount
-- SWC-135: Code with no effects
-- SWC-136: Unencrypted private data on-chain
-
-**Instruction**: "For each SWC, check if the pattern exists in this contract. Skip ones that are clearly N/A (e.g., no selfdestruct = skip SWC-106). Focus on the ones that ARE relevant."
-
-### Agent 2: EIP-712 & Signature Attacks
-
-**Role**: Attack the signature verification logic.
-
-**Playbook**:
-- **Replay attacks**: Can a valid signature be replayed on a different chain? Different contract deployment? Different job? After contract upgrade?
-- **Malleability**: Does the contract check `s <= secp256k1n/2`? (EIP-2). Can the same signature be submitted twice with different (v,s) values?
-- **ecrecover returns address(0)**: Does the contract check that the recovered address is not address(0)? An invalid signature returns 0x0 — if any role maps to 0x0, that's a critical vulnerability.
-- **Domain separator**: Is chainId included? Is the contract address included? Is there a salt? What happens if the contract is deployed at the same address on a different chain (CREATE2)?
-- **Nonce handling**: Are nonces used? Can they be skipped? Can they be reused? Is there a nonce per job or global?
-- **Signature length**: What happens with truncated signatures? Empty bytes? Oversized data?
-- **EIP-1271 (contract signatures)**: Does the contract support smart contract wallets? Should it?
-- **Permit integration**: If the token supports permit(), can permit + deposit be front-run?
-- **ERC-4337 Account Abstraction**: If the contract is a paymaster, validator, or smart wallet module, check UserOperation validation phase restrictions (no access to external storage), bundler griefing vectors, and signature validation in `validateUserOp`. Reference Trail of Bits' "six failure modes" analysis.
-
-**Instruction**: "Try to construct a concrete exploit for each attack vector. If the contract uses OpenZeppelin's ECDSA or EIP712, check the specific version for known issues. If the contract interacts with ERC-4337 infrastructure, check validation phase storage restrictions."
-
-### Agent 3: Reentrancy & External Calls
-
-**Role**: Find reentrancy vulnerabilities through all external call paths.
-
-**Playbook**:
-- **Classic reentrancy**: Map every external call (token transfers, delegatecalls). For each, check: is state updated BEFORE the call? Is nonReentrant used?
-- **Cross-function reentrancy**: Can a callback from function A re-enter function B that reads stale state? Map all state that's shared between functions.
-- **Read-only reentrancy**: Can a view function return stale data during a reentrant call? (Relevant if other contracts read this contract's state.)
-- **ERC20 callback reentrancy**: ERC777 tokens have transfer hooks. Does the contract assume ERC20 transfers are non-reentrant? Is the token address immutable?
-- **Create2 reentrancy**: Can an attacker deploy a contract at a predictable address that reenters during construction?
-- **transferFrom reentrancy**: Some tokens (e.g., imBTC) have callbacks on transferFrom. Check if deposit() is safe.
-- **Transient storage reentrancy (EIP-1153)**: Locks using `tstore`/`tload` reset per transaction, not per call. A `nonReentrant` guard implemented with transient storage behaves differently than SSTORE-based guards — it allows reentry across transactions in the same block. Check if the contract uses transient storage for reentrancy protection and whether this creates a new attack surface.
-
-**Instruction**: "For each external call in the contract, trace the full call stack. Determine if any state is read after the call that was set before the call. nonReentrant blocks same-function reentry but NOT cross-function reentry on different contracts. If transient storage (EIP-1153) is used, verify locks persist correctly across the full call context."
-
-### Agent 4: State Machine & Access Control
-
-**Role**: Find invalid state transitions and access control bypasses.
-
-**Playbook**:
-- **Transition matrix**: Build a complete matrix of (current_state, function) → (allowed?, new_state). Every cell must be either "allowed" or "reverts". Look for missing revert checks.
-- **State finality**: Terminal states must be unreachable from. Can any function transition OUT of a terminal state?
-- **Role escalation**: Can any role grant itself more permissions? Can the DEFAULT_ADMIN_ROLE be renounced, bricking the contract?
-- **Initialization attacks**: Can anyone call initialize/constructor-like functions after deployment? Are roles granted atomically in deploy?
-- **Proxy & upgradeability**: If upgradeable, check: (a) Can the implementation contract be initialized directly by an attacker? (Nomad Bridge, $190M). (b) UUPS: is `_authorizeUpgrade` protected with access control? Can it be removed in an upgrade, bricking upgradeability? (c) Transparent proxy: storage slot collisions between proxy admin and implementation? (d) Storage layout: do upgrades preserve slot ordering? New variables must be appended, never inserted. (e) Is there a timelock on upgrades? (f) Can `delegatecall` to a malicious implementation `selfdestruct` the proxy?
-- **Race conditions**: Can two transactions targeting the same entity both succeed? E.g., release() and dispute() in the same block.
-- **Multi-instance isolation**: Can actions on instance A affect instance B? Shared state?
-- **Conservation invariant**: `sum(all held amounts in non-terminal states) == contract token balance` at all times. Fuzz this.
-
-**Instruction**: "Build the full transition matrix. If there are N states and M functions, that's N*M cells to check. Every cell matters. Also verify the conservation invariant holds under all transitions."
-
-### Agent 5: ERC20 Token Edge Cases
-
-**Role**: Attack through token behavior rather than contract logic.
-
-**Playbook**:
-- **Fee-on-transfer tokens**: If the token charges fees, `transferFrom(amount)` delivers less than `amount`. Does the contract account for this? Is the token immutable?
-- **Rebasing tokens**: If the token's balance changes spontaneously (aave aTokens, stETH), does the contract handle balance != deposited amount?
-- **Pausable tokens**: USDC can be paused by Circle. When paused, all transfers revert. Can this lock funds in the contract forever? Is there an emergency escape?
-- **Blacklistable tokens**: USDC can blacklist addresses. If a party is blacklisted, transfers to them revert. Does multi-party payout handle partial failure?
-- **Upgradeable tokens**: USDC is a proxy. The implementation can change. Could a future upgrade break the contract's assumptions?
-- **Return value handling**: Does the contract check return values of transfer/transferFrom? Some tokens return false instead of reverting. Is SafeERC20 used?
-- **No-return tokens**: Some tokens (old USDT) don't return a bool. SafeERC20.safeTransfer handles this.
-- **Approval race**: If changing allowance from non-zero to non-zero, some tokens are vulnerable to front-running. Is approve() used safely?
-- **Decimals**: Does the contract assume specific decimals? What if the token has 0 decimals?
-- **MAX_UINT approval**: Does the contract rely on infinite approval? Can it be drained by a malicious token?
-- **ERC-4626 vault inflation attack**: If the contract is a vault or interacts with ERC-4626, check the first-depositor attack — an attacker can frontrun the first deposit with a tiny deposit + direct token transfer to inflate the share price, causing subsequent depositors to receive 0 shares due to rounding. Check if `_decimalsOffset()` or virtual shares/assets are used as mitigation.
-
-**Instruction**: "Focus on the SPECIFIC token this contract uses. If it's USDC, check Circle's actual blacklist/pause behavior. If it's arbitrary, every edge case matters. If ERC-4626, check the share inflation vector."
-
-### Agent 6: Economic & Game Theory Attacks
-
-**Role**: Find ways to extract value or game the system through economic incentives.
-
-**Playbook**:
-- **MEV / front-running**: Can a miner/sequencer reorder transactions for profit? E.g., see a resolve() in the mempool and front-run with dispute().
-- **Collusion**: Can any two parties collude against a third? What's the maximum extractable value? Do fee caps limit damage?
-- **Fee rounding attacks**: With small amounts, do fee calculations round to 0? Can an attacker use dust amounts to avoid fees? Fuzz fee calculations for all edge values.
-- **Griefing attacks**: Can someone force another party into a worse position at low cost to themselves?
-- **Sniping/front-running deposits**: Can an attacker act on someone else's behalf before them?
-- **Bait-and-switch**: Can a proposal made in one state be accepted in a different, more advantageous state?
-- **Timestamp manipulation**: On L2s, the sequencer controls block.timestamp. Can manipulated timestamps affect time-sensitive operations?
-- **Multi-instance economic attacks**: Can an attacker leverage multiple instances against each other?
-- **Incentive misalignment**: Are there situations where a rational actor's best move harms the system? Map out the game tree for each participant.
-
-**Instruction**: "Think like a rational economic actor trying to maximize their profit at others' expense. For each attack, calculate: what's the attacker's cost, what's the victim's loss, and what's the probability of success?"
-
-### Agent 7: L2 & Chain-Specific Attacks
-
-**Role**: Find vulnerabilities specific to the deployment chain.
-
-**Playbook**:
-- **Sequencer downtime**: On L2s, the sequencer can go down. During downtime, no transactions process. If the contract has time-sensitive operations (dispute windows, timeouts), sequencer downtime can cause unfair expiry.
-- **L1→L2 message delays**: If the contract interacts with L1, messages take ~7 days (optimistic rollup). Relevant?
-- **Gas price spikes**: L2 gas is usually cheap but can spike. Can gas price spikes make certain operations economically unfeasible?
-- **Block.timestamp on L2**: On L2s, block.timestamp comes from the sequencer. It's generally reliable but not guaranteed to match L1 time exactly.
-- **CREATE2 + reorg**: On L2s, reorgs are possible (pre-finality on L1). Can a contract deployed via CREATE2 be frontrun on reorg?
-- **Chain-specific precompiles**: Does the contract use any chain-specific features?
-- **Cross-chain replay**: If deployed on multiple chains, can transactions be replayed? Is chainId in the domain separator?
-- **Bridge interactions**: Does the contract interact with any bridges?
-- **EIP-4844 blob data**: Does the contract rely on calldata that might move to blobs?
-
-**Instruction**: "Check what chain this is deployed on and research that specific chain's quirks. Base is an OP Stack L2 — check for OP Stack-specific issues."
-
-### Agent 8: Backend & Integration Review
-
-**Requires**: `--include-backend <path>` flag. If not provided, skip this agent.
-
-**Role**: Attack the off-chain integration layer. Smart contracts don't exist in isolation.
-
-**Playbook**:
-- **Transaction confirmation**: Does the backend wait for transaction confirmation before updating DB state? `writeContract()` in viem returns a tx hash BEFORE the tx is mined. If the backend writes to DB immediately, a reverted tx creates state divergence.
-- **RPC reliability**: Does the backend have fallback RPCs? What happens if the RPC returns stale data (load-balanced nodes at different block heights)?
-- **Nonce management**: If the backend sends multiple transactions, are nonces handled correctly? Concurrent calls can cause nonce conflicts.
-- **Private key security**: Where is the relayer key stored? Is it in env vars, a secrets manager, an HSM? Can it be extracted from server memory?
-- **Event parsing**: Does the backend parse on-chain events correctly? ABI changes can break event parsing silently.
-- **Error handling**: What happens when an on-chain call reverts? Does the backend retry? Does it surface the revert reason?
-- **Race conditions**: Can the backend process two requests for the same entity simultaneously? Is there locking?
-- **Input validation**: Does the backend validate addresses, amounts, IDs before sending on-chain? Can a malformed input cause unexpected behavior?
-- **Gas estimation**: Does the backend estimate gas correctly? What happens if gas estimation fails?
-- **Relayer as chokepoint**: If the relayer wallet runs out of ETH/gas, all on-chain operations stop. Is there monitoring?
-
-**Instruction**: "Read the backend code at the path provided. Check every function that calls writeContract/readContract. Trace the full flow from API request to on-chain execution to DB update."
-
-### Agent 9: Flash Loan & DeFi Composability Attacks
-
-**Role**: Find vulnerabilities exploitable through atomic composability — flash loans, sandwich attacks, and multi-protocol interactions.
-
-**Playbook**:
-- **Flash loan amplification**: Can an attacker borrow unlimited tokens via flash loan (Aave, dYdX, Balancer) to manipulate contract state within a single transaction?
-- **Sandwich attacks**: Can a transaction be sandwiched (front-run + back-run) profitably?
-- **Atomic arbitrage**: Can an attacker compose multiple contract calls in a single tx to create a risk-free profit? E.g., deposit + complete + release all in one tx via a malicious contract.
-- **Price oracle manipulation**: If the contract references any external price (even indirectly via token value), can a flash loan move that price within a single block?
-- **Composability with other protocols**: If tokens are yield-bearing or LP tokens, can their value be manipulated mid-transaction?
-- **Callback exploitation**: Can a caller be a smart contract that uses callbacks to manipulate state?
-- **Single-tx drain**: Map every possible sequence of function calls an attacker could execute atomically. Can any sequence drain funds or create an inconsistent state?
-
-**Instruction**: "Write a concrete Foundry test that demonstrates each viable attack. If the attack is blocked, explain exactly what prevents it. Focus on the atomic (single-transaction) nature of flash loans — the attacker has unlimited capital but must repay within the same tx."
-
-### Agent 10: DoS, Griefing & Fund Locking
-
-**Role**: Find ways to permanently or temporarily brick the contract, lock funds, or make operations prohibitively expensive — without stealing anything.
-
-**Playbook**:
-- **Permanent fund locking**: Can funds become permanently irretrievable? Check every terminal state — is there always a path to withdraw? What if all parties disappear?
-- **Reverting receiver DoS**: If a recipient's `receive()`/`fallback()` reverts (or if it's a contract with no receive function), does it block payouts to ALL parties?
-- **Gas griefing**: Can an attacker make a function consume excessive gas? Unbounded loops, large storage reads, returndata bombs from malicious contracts.
-- **Storage bloat**: Can an attacker create unlimited storage entries (e.g., unlimited instances with dust amounts)?
-- **Admin key loss**: What happens if the admin/relayer private key is lost? Can the contract be recovered? Can roles be re-granted?
-- **Pause griefing**: If the contract is pausable, can a compromised admin pause it permanently? Is there a timelock on pause?
-- **Block stuffing**: Can an attacker fill blocks to prevent time-sensitive operations?
-- **Self-destruct interactions**: Can a self-destructing contract force ETH into the contract, breaking any balance checks?
-- **Token approval drainage**: Can a previously-approved spender drain the contract's token balance?
-- **Denial by front-running**: Can an attacker front-run a legitimate transaction to make it revert?
-- **Stuck funds enumeration**: Is there any combination of party actions (or inactions) that results in funds stuck with no path to release? Enumerate all parties being unresponsive.
-
-**Instruction**: "The goal is NOT to steal funds — it's to make the contract unusable or lock funds forever. For each attack, determine: is it permanent or temporary? What's the attacker's cost vs. the victim's damage? Can the contract admin recover from it?"
-
-### Agent 11: Privacy & Information Leakage
-
-**Role**: Find sensitive information that's exposed on-chain or through transaction patterns.
-
-**Playbook**:
-- **Pending transaction visibility**: All pending transactions are visible in the mempool (or sequencer queue on L2). Can seeing a pending transaction allow front-running for profit?
-- **Amount as signal**: Are amounts public? Does this leak business-sensitive information?
-- **Party identity correlation**: Can on-chain addresses be correlated with real identities through the backend API?
-- **Privileged role identity**: Are privileged addresses public? Can this be used to pressure/bribe them off-chain?
-- **Transaction timing analysis**: Can the pattern of operations reveal information about the service being performed?
-- **Revert reason leakage**: Do revert messages expose internal state that should be private?
-- **Event data exposure**: Do emitted events contain more information than necessary?
-- **Storage slot reading**: Anyone can read all storage slots directly (even "private" variables). Is any sensitive data stored on-chain that shouldn't be?
-
-**Instruction**: "Think like an adversary who wants to gather intelligence, not steal funds. What can you learn about the parties and their deals just by watching the chain? Does any of this information create an attack vector when combined with off-chain data?"
+**Quick reference — agent roles:**
+1. **SWC Registry** — systematic SWC-100 through SWC-136 check
+2. **Signatures** — replay, malleability, ecrecover(0), domain separator, ERC-4337
+3. **Reentrancy** — classic, cross-function, read-only, ERC777, transient storage (EIP-1153)
+4. **State Machine** — transition matrix, role escalation, initialization, proxy/UUPS
+5. **ERC20 Edge Cases** — fee-on-transfer, rebasing, pausable, blacklist, vault inflation (ERC-4626)
+6. **Economic** — MEV, collusion, fee rounding, griefing, incentive misalignment
+7. **L2-Specific** — sequencer downtime, timestamp, reorgs, cross-chain replay
+8. **Backend** — tx confirmation, RPC, nonce, key security, event parsing (opt-in)
+9. **Flash Loans** — amplification, sandwich, atomic arbitrage, oracle manipulation
+10. **DoS/Griefing** — fund locking, reverting receiver, gas griefing, storage bloat
+11. **Privacy** — mempool visibility, identity correlation, storage slot reading
 
 ---
 
 ## Step 2.5: Proof-of-Concept round (conditional)
 
-**Pre-check**: Only run this step if `forge build` succeeded in Step 1b.
+**Pre-check**: Only run this step if `forge build` succeeded in Step 1c.
 
 After all agents report, check if any CRITICAL or HIGH findings were reported. If yes:
 
@@ -364,22 +263,68 @@ After all agents report, check if any CRITICAL or HIGH findings were reported. I
 **If a PoC succeeds (exploit works):** finding is confirmed CRITICAL regardless of agent's original rating.
 **If a PoC succeeds (exploit blocked):** finding is downgraded with explanation.
 
-If `forge build` failed in Step 1b, skip this step entirely and note in the report:
+If `forge build` failed in Step 1c, skip this step entirely and note in the report:
 ```
-PoC validation: SKIPPED (project failed to compile — see Step 1b errors)
+PoC validation: SKIPPED (project failed to compile — see Step 1c errors)
 All CRITICAL/HIGH findings are unvalidated. Manual review strongly recommended.
 ```
+
+## Step 2.75: False-Positive Gate Review
+
+After all agents report and PoCs are attempted, spawn ONE agent to **challenge every CRITICAL and HIGH finding**. This agent's job is to disprove findings, not confirm them.
+
+For each CRITICAL/HIGH finding, apply these 6 gates:
+
+| Gate | Question | PASS if... | FAIL if... |
+|------|----------|------------|------------|
+| **1. Reachability** | Can an attacker actually reach this code path with controlled input? | Clear path from external call to vulnerable code | Code is unreachable, requires trusted caller, or input is bounded upstream |
+| **2. Validation Chain** | Is there upstream validation that prevents the attack? | No prior check blocks the exploit | A require/assert/if-revert earlier in the call chain makes the condition impossible |
+| **3. Math Bounds** | Do the math constraints actually allow the vulnerable condition? | Algebraic proof that vulnerable values are possible | Math proves the condition cannot occur (e.g., underflow impossible due to prior bounds) |
+| **4. State Preconditions** | Can the contract actually be in the required state for the exploit? | State is reachable through normal or adversarial usage | Required state is unreachable or requires trusted-role cooperation |
+| **5. Economic Viability** | Is the attack profitable or at least cheap enough to grief? | Attack cost < extracted value, OR griefing cost is low | Attack costs more than it extracts with no griefing benefit |
+| **6. Environment** | Do environmental protections (reentrancy guards, pauses, timelocks) prevent it? | No environmental protection blocks the exploit | nonReentrant, whenNotPaused, timelock, or similar blocks it entirely |
+
+**Verdict per finding:**
+- All 6 gates PASS → **TRUE POSITIVE** (stays at current severity)
+- Any gate FAIL → **FALSE POSITIVE** or **DOWNGRADE** with documented reason
+
+```
+FP-CHECK: [C-1] Reward pool drainage via withdrawUnusedRewards
+  Gate 1 (Reachability): PASS — onlyOwner, but owner IS the threat model here
+  Gate 2 (Validation):   PASS — no check that withdrawn amount < owed rewards
+  Gate 3 (Math Bounds):  PASS — owner can withdraw full balance
+  Gate 4 (State):        PASS — any state with funded rewards
+  Gate 5 (Economic):     PASS — pure profit for malicious owner
+  Gate 6 (Environment):  PASS — no timelock, no multisig at contract level
+  VERDICT: TRUE POSITIVE — confirmed CRITICAL
+```
+
+**Why this matters**: LLMs are biased toward seeing bugs. Pattern-matching "this looks dangerous" produces false positives that waste the user's time and erode trust. The gate review forces evidence-based verification of each finding. Trail of Bits reports that this step alone eliminates 30-50% of initial findings as false positives.
+
+Pass the gate review results to the synthesis agent.
+
+## Step 2.9: Variant Analysis
+
+For each TRUE POSITIVE from the FP-Check, search the entire codebase for the same root cause pattern in other functions or contracts. A bug found once often exists in sibling code.
+
+For example:
+- If an unchecked return value is found in `deposit()`, grep for the same call pattern in `withdraw()`, `claim()`, etc.
+- If a missing access control is found on `setFee()`, check all other setter functions.
+- If a rounding error is found in share calculation, check all other division operations.
+
+Use Grep to search for the pattern. Report any variants found as additional findings at the same severity.
 
 ## Step 3: Synthesize findings (single agent)
 
 Spawn ONE synthesis agent with:
-- The Contract Brief
+- The Contract Brief (including entry-point table and invariant list)
 - All agent outputs (only the selected agents, not all 11)
 - PoC test results (which exploits succeeded, which were blocked, which failed to compile)
+- FP-Check gate review results (which findings passed, which were downgraded/rejected)
 - Slither output (or "Slither not available" note)
 - Extended thinking enabled (ultrathink)
 
-**Instruction**: "Synthesize all findings into a final audit report. De-duplicate findings that multiple agents flagged — credit all agents that found it. Findings with working PoC exploits are automatically CRITICAL. Findings where the PoC showed the attack is blocked should be downgraded. Findings where the PoC failed to compile remain at original severity with a note."
+**Instruction**: "Synthesize all findings into a final audit report. De-duplicate findings that multiple agents flagged — credit all agents that found it. Findings with working PoC exploits are automatically CRITICAL. Findings where the PoC showed the attack is blocked should be downgraded. Findings where the PoC failed to compile remain at original severity with a note. Findings that FAILED the FP-Check gate review should be excluded or listed separately as 'Investigated but not confirmed.' Never include a finding that failed a gate review at CRITICAL or HIGH severity."
 
 The report MUST follow this format:
 
@@ -393,6 +338,8 @@ The report MUST follow this format:
 ### Agents skipped: [list + reason, e.g., "Backend (no --include-backend flag)"]
 ### Static analysis: [Slither available/skipped]
 ### PoC validation: [available/skipped + reason]
+### FP-Check: [X of Y findings confirmed as TRUE POSITIVE, Z downgraded/rejected]
+### Entry points analyzed: [N public unrestricted, M role-restricted, P contract-only]
 
 ---
 
