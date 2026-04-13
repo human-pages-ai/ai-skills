@@ -9,6 +9,7 @@ By [Human Pages AI](https://humanpages.ai).
 | Skill | Description |
 |-------|-------------|
 | [war](./war) | Multi-perspective adversarial debate. Spawns 6 sub-agents with opposing viewpoints across 3 rounds to stress-test any plan, strategy, or decision. |
+| [audit-contract](./audit-contract) | Adversarial smart contract security audit. Auto-selects 5-7 specialist agents (from a roster of 11) based on contract features. Runs Slither, writes Foundry PoC tests, produces a ranked finding list with severity and code fixes. |
 | [screenshot](./screenshot) | Reads and analyzes the latest screenshot from your Screenshots folder. |
 | [humanpages](./humanpages) | Hire real humans for tasks agents can't do alone — QA testing, directory submissions, translations, and more. 36 MCP tools for the full hiring lifecycle. |
 
