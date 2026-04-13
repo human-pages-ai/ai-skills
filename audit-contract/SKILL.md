@@ -7,7 +7,7 @@ description: |
   economic exploits, game theory, L2-specific, flash loans, DoS/griefing, privacy,
   backend integration. Runs Slither if available. Writes Foundry PoC tests for
   critical findings. Produces a ranked finding list with severity and code fixes.
-  Triggers on: "audit this contract", "security review", "is this contract safe",
+  Triggers on: "audit this contract", "security review",
   "attack this contract", "find vulnerabilities".
 allowed-tools:
   - Agent
@@ -70,7 +70,7 @@ Based on the Contract Brief, select which agents to run. Default is 5-7 agents. 
 | 1. SWC Registry | **Always** — baseline check |
 | 2. Signatures | Contract uses ecrecover, EIP-712, or any signature verification |
 | 3. Reentrancy | Contract makes external calls (token transfers, delegatecalls, low-level calls) |
-| 4. State Machine | Contract has >2 states or role-based access control |
+| 4. State Machine | Contract has >2 states, role-based access control, or is upgradeable (proxy/UUPS) |
 | 5. ERC20 Edge Cases | Contract interacts with ERC20 tokens |
 | 6. Economic/Game Theory | Contract involves payments, fees, multi-party incentives |
 | 7. L2-Specific | Contract deploys on L2 AND has time-sensitive operations |
@@ -182,8 +182,9 @@ Every agent MUST:
 - **Signature length**: What happens with truncated signatures? Empty bytes? Oversized data?
 - **EIP-1271 (contract signatures)**: Does the contract support smart contract wallets? Should it?
 - **Permit integration**: If the token supports permit(), can permit + deposit be front-run?
+- **ERC-4337 Account Abstraction**: If the contract is a paymaster, validator, or smart wallet module, check UserOperation validation phase restrictions (no access to external storage), bundler griefing vectors, and signature validation in `validateUserOp`. Reference Trail of Bits' "six failure modes" analysis.
 
-**Instruction**: "Try to construct a concrete exploit for each attack vector. If the contract uses OpenZeppelin's ECDSA or EIP712, check the specific version for known issues."
+**Instruction**: "Try to construct a concrete exploit for each attack vector. If the contract uses OpenZeppelin's ECDSA or EIP712, check the specific version for known issues. If the contract interacts with ERC-4337 infrastructure, check validation phase storage restrictions."
 
 ### Agent 3: Reentrancy & External Calls
 
@@ -196,8 +197,9 @@ Every agent MUST:
 - **ERC20 callback reentrancy**: ERC777 tokens have transfer hooks. Does the contract assume ERC20 transfers are non-reentrant? Is the token address immutable?
 - **Create2 reentrancy**: Can an attacker deploy a contract at a predictable address that reenters during construction?
 - **transferFrom reentrancy**: Some tokens (e.g., imBTC) have callbacks on transferFrom. Check if deposit() is safe.
+- **Transient storage reentrancy (EIP-1153)**: Locks using `tstore`/`tload` reset per transaction, not per call. A `nonReentrant` guard implemented with transient storage behaves differently than SSTORE-based guards — it allows reentry across transactions in the same block. Check if the contract uses transient storage for reentrancy protection and whether this creates a new attack surface.
 
-**Instruction**: "For each external call in the contract, trace the full call stack. Determine if any state is read after the call that was set before the call. nonReentrant blocks same-function reentry but NOT cross-function reentry on different contracts."
+**Instruction**: "For each external call in the contract, trace the full call stack. Determine if any state is read after the call that was set before the call. nonReentrant blocks same-function reentry but NOT cross-function reentry on different contracts. If transient storage (EIP-1153) is used, verify locks persist correctly across the full call context."
 
 ### Agent 4: State Machine & Access Control
 
@@ -208,7 +210,7 @@ Every agent MUST:
 - **State finality**: Terminal states must be unreachable from. Can any function transition OUT of a terminal state?
 - **Role escalation**: Can any role grant itself more permissions? Can the DEFAULT_ADMIN_ROLE be renounced, bricking the contract?
 - **Initialization attacks**: Can anyone call initialize/constructor-like functions after deployment? Are roles granted atomically in deploy?
-- **Proxy concerns**: If upgradeable, can the implementation be initialized separately? Storage collision?
+- **Proxy & upgradeability**: If upgradeable, check: (a) Can the implementation contract be initialized directly by an attacker? (Nomad Bridge, $190M). (b) UUPS: is `_authorizeUpgrade` protected with access control? Can it be removed in an upgrade, bricking upgradeability? (c) Transparent proxy: storage slot collisions between proxy admin and implementation? (d) Storage layout: do upgrades preserve slot ordering? New variables must be appended, never inserted. (e) Is there a timelock on upgrades? (f) Can `delegatecall` to a malicious implementation `selfdestruct` the proxy?
 - **Race conditions**: Can two transactions targeting the same entity both succeed? E.g., release() and dispute() in the same block.
 - **Multi-instance isolation**: Can actions on instance A affect instance B? Shared state?
 - **Conservation invariant**: `sum(all held amounts in non-terminal states) == contract token balance` at all times. Fuzz this.
@@ -230,8 +232,9 @@ Every agent MUST:
 - **Approval race**: If changing allowance from non-zero to non-zero, some tokens are vulnerable to front-running. Is approve() used safely?
 - **Decimals**: Does the contract assume specific decimals? What if the token has 0 decimals?
 - **MAX_UINT approval**: Does the contract rely on infinite approval? Can it be drained by a malicious token?
+- **ERC-4626 vault inflation attack**: If the contract is a vault or interacts with ERC-4626, check the first-depositor attack — an attacker can frontrun the first deposit with a tiny deposit + direct token transfer to inflate the share price, causing subsequent depositors to receive 0 shares due to rounding. Check if `_decimalsOffset()` or virtual shares/assets are used as mitigation.
 
-**Instruction**: "Focus on the SPECIFIC token this contract uses. If it's USDC, check Circle's actual blacklist/pause behavior. If it's arbitrary, every edge case matters."
+**Instruction**: "Focus on the SPECIFIC token this contract uses. If it's USDC, check Circle's actual blacklist/pause behavior. If it's arbitrary, every edge case matters. If ERC-4626, check the share inflation vector."
 
 ### Agent 6: Economic & Game Theory Attacks
 
@@ -381,7 +384,7 @@ Spawn ONE synthesis agent with:
 The report MUST follow this format:
 
 ```
-## Audit Verdict: [SAFE TO DEPLOY / DEPLOY WITH FIXES / DO NOT DEPLOY]
+## Audit Verdict: [NO CRITICAL ISSUES DETECTED / ISSUES FOUND — FIXES REQUIRED / CRITICAL ISSUES — DO NOT DEPLOY]
 
 ### Contract: [name] on [chain]
 ### Audited: [date]
@@ -397,7 +400,7 @@ The report MUST follow this format:
 For each finding:
 - **[C-N] Title**
   - Severity: CRITICAL
-  - PoC status: CONFIRMED / FAILED (error) / SKIPPED (reason)
+  - PoC status: CONFIRMED (compiled & passed) / DRAFT (failed to compile — manual verification needed) / SKIPPED (reason)
   - Location: `file.sol:lineNumber` — `functionName()`
   - Description: What's wrong
   - Exploit scenario: Step-by-step how an attacker would exploit this
@@ -424,8 +427,14 @@ For each finding:
 
 ### Recommended Next Steps
 1. [Ordered list of actions]
-2. [If relevant: "Consider running Echidna/Medusa fuzzing on invariant X"]
+2. [If relevant: "Run invariant fuzzing with Echidna/Medusa on [specific invariant] — this is the natural next step after an AI audit and catches stateful bugs that static analysis misses"]
 3. [If relevant: "Consider formal verification for the state machine"]
+
+### Audit Scope Limitations
+- This audit was generated by AI agents using static analysis and adversarial reasoning. It is NOT a professional security audit.
+- Proof-of-concept tests are best-effort drafts that may require manual adjustment to compile and run.
+- Coverage is limited to the Solidity source provided. Dependency/supply chain analysis, formal verification, and invariant fuzzing are out of scope.
+- For contracts managing significant value, commission an independent audit from a qualified security firm before deploying to mainnet.
 ```
 
 ## Step 4: Present results
@@ -467,3 +476,6 @@ These are patterns from actual mainnet exploits. Every agent should keep these i
 | Logic error in state machine | Unexpected state transition | Wormhole ($320M) |
 | Uninitialized proxy | Implementation can be initialized | Nomad Bridge ($190M) |
 | Token approval drain | Leftover approvals exploited | Various DEX hacks |
+| Supply chain attack | Compromised signing UI / dependency | Bybit ($1.5B via Safe{Wallet} JS injection) |
+| Vault share inflation | First depositor manipulates share price | Multiple ERC-4626 vaults (2024) |
+| Transient storage reentrancy | EIP-1153 tstore/tload lock bypass | Emerging vector (2025+) |
