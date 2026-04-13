@@ -98,7 +98,7 @@ Detailed playbooks for each of the 11 specialist agents. The orchestrator spawns
 - **Fee-on-transfer tokens**: If the token charges fees, `transferFrom(amount)` delivers less than `amount`. Does the contract account for this? Is the token immutable?
 - **Rebasing tokens**: If the token's balance changes spontaneously (aave aTokens, stETH), does the contract handle balance != deposited amount?
 - **Pausable tokens**: USDC can be paused by Circle. When paused, all transfers revert. Can this lock funds in the contract forever? Is there an emergency escape?
-- **Blacklistable tokens**: USDC can blacklist addresses. If a party is blacklisted, transfers to them revert. Does multi-party payout handle partial failure?
+- **Blacklistable tokens**: USDC can blacklist addresses. If a party is blacklisted, transfers to them revert. Does multi-party payout handle partial failure? **Enumerate EVERY address that appears in a safeTransfer/transfer call — not just the obvious parties (depositor, payee). Check third-party recipients (arbitrators, fee collectors, treasury addresses). If any recipient's transfer is mandatory (no if > 0 guard, or the amount is always nonzero by construction), blacklisting that address bricks the entire function.**
 - **Upgradeable tokens**: USDC is a proxy. The implementation can change. Could a future upgrade break the contract's assumptions?
 - **Return value handling**: Does the contract check return values of transfer/transferFrom? Some tokens return false instead of reverting. Is SafeERC20 used?
 - **No-return tokens**: Some tokens (old USDT) don't return a bool. SafeERC20.safeTransfer handles this.
@@ -123,8 +123,9 @@ Detailed playbooks for each of the 11 specialist agents. The orchestrator spawns
 - **Timestamp manipulation**: On L2s, the sequencer controls block.timestamp. Can manipulated timestamps affect time-sensitive operations?
 - **Multi-instance economic attacks**: Can an attacker leverage multiple instances against each other?
 - **Incentive misalignment**: Are there situations where a rational actor's best move harms the system? Map out the game tree for each participant.
+- **Alternative path comparison**: If multiple functions can reach the same terminal state (e.g., resolve() and forceRelease() both exit Disputed), **compare what each party receives from each path**. Any difference in payout, fee, or timing creates an incentive to prefer one path. Check whether a party can manipulate which path executes (e.g., by stalling, front-running, or colluding with a gatekeeper). Fee bypasses through timeout/fallback paths are a common pattern.
 
-**Instruction**: "Think like a rational economic actor trying to maximize their profit at others' expense. For each attack, calculate: what's the attacker's cost, what's the victim's loss, and what's the probability of success?"
+**Instruction**: "Think like a rational economic actor trying to maximize their profit at others' expense. For each attack, calculate: what's the attacker's cost, what's the victim's loss, and what's the probability of success? When multiple code paths reach the same end state, always compare economic outcomes across paths."
 
 ### Agent 7: L2 & Chain-Specific Attacks
 
