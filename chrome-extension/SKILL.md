@@ -83,16 +83,29 @@ if (!panel) {
   await new Promise(r => setTimeout(r, 3000));
 }
 
-// Send a task
-await panel.click('.tiptap.ProseMirror');
-await panel.evaluate((task) => {
-  const editor = document.querySelector('.tiptap.ProseMirror');
-  editor.focus();
-  document.execCommand('insertText', false, task);
-}, 'YOUR TASK HERE');
-await panel.evaluate(() => {
-  document.querySelector('button[aria-label="Send message"]')?.click();
-});
+// Send a task (with duplicate guard)
+const task = 'YOUR TASK HERE';
+const alreadySent = await panel.evaluate((t) => {
+  const msgs = document.querySelectorAll('[data-testid="user-message"], .font-user-message');
+  for (const m of msgs) {
+    if (m.innerText.trim().substring(0, 80) === t.substring(0, 80)) return true;
+  }
+  return false;
+}, task);
+
+if (alreadySent) {
+  console.log('Task already sent — skipping to poll phase');
+} else {
+  await panel.click('.tiptap.ProseMirror');
+  await panel.evaluate((t) => {
+    const editor = document.querySelector('.tiptap.ProseMirror');
+    editor.focus();
+    document.execCommand('insertText', false, t);
+  }, task);
+  await panel.evaluate(() => {
+    document.querySelector('button[aria-label="Send message"]')?.click();
+  });
+}
 
 // Wait for response (poll until stable)
 let prev = '';
@@ -119,6 +132,7 @@ await browser.disconnect();
 - **Reuse the panel**: Check for an existing sidepanel page before opening a new one.
 - **The extension browses in real tabs**: It opens and navigates Chrome tabs. The user's browser is actively used.
 - **Response polling**: Check for the Stop button disappearing + text stabilizing to know when it's done.
+- **Protocol timeouts ≠ task failure**: If `panel.evaluate()` times out during polling, the extension may still be working. Never resend without checking if the task is already in the conversation history. The duplicate guard in the code above handles this.
 
 ## Why bind mount?
 
