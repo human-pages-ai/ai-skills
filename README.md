@@ -12,6 +12,7 @@ By [Human Pages AI](https://humanpages.ai).
 | [audit-contract](./audit-contract) | Adversarial smart contract security audit. Auto-selects 5-7 specialist agents (from a roster of 11) based on contract features. Runs Slither, writes Foundry PoC tests, produces a ranked finding list with severity and code fixes. |
 | [screenshot](./screenshot) | Reads and analyzes the latest screenshot from your Screenshots folder. |
 | [humanpages](./humanpages) | Hire real humans for tasks agents can't do alone — QA testing, directory submissions, translations, and more. 36 MCP tools for the full hiring lifecycle. |
+| [chrome-extension](./chrome-extension) | Drive the Claude Chrome extension from the CLI. Gives Claude Code browser agent capabilities via Puppeteer and CDP — browse, fill forms, check social media, anything the extension can do. |
 
 ## Install
 
