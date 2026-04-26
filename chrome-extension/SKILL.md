@@ -83,8 +83,12 @@ if (!panel) {
   await new Promise(r => setTimeout(r, 3000));
 }
 
-// Set up CDP network interception for structured API responses
+// Prevent Chrome from throttling the panel (it's a background tab)
 const client = await panel.createCDPSession();
+await client.send('Emulation.setFocusEmulationEnabled', { enabled: true });
+await client.send('Page.setWebLifecycleState', { state: 'active' });
+
+// Set up CDP network interception for structured API responses
 await client.send('Network.enable');
 
 const apiResponses = [];
@@ -103,7 +107,17 @@ client.on('Network.loadingFinished', async (params) => {
   if (pendingRequests.has(params.requestId)) {
     try {
       const resp = await client.send('Network.getResponseBody', { requestId: params.requestId });
-      apiResponses.push(JSON.parse(resp.body));
+      const raw = resp.body;
+      if (raw.startsWith('event:')) {
+        // SSE streaming response — parse each event
+        for (const event of raw.split('\n\n').filter(Boolean)) {
+          const dataLine = event.split('\n').find(l => l.startsWith('data: '));
+          if (!dataLine) continue;
+          try { apiResponses.push(JSON.parse(dataLine.slice(6))); } catch(e) {}
+        }
+      } else {
+        apiResponses.push(JSON.parse(raw));
+      }
     } catch(e) {}
     pendingRequests.delete(params.requestId);
   }
@@ -177,6 +191,7 @@ await browser.disconnect();
 - **tabId is required**: Without it in the URL, the extension loads but can't call the API.
 - **Reuse the panel**: Check for an existing sidepanel page before opening a new one.
 - **The extension browses in real tabs**: It opens and navigates Chrome tabs. The user's browser is actively used.
+- **Prevent throttling**: The panel opens as a background tab. Chrome throttles it unless you call `Emulation.setFocusEmulationEnabled` + `Page.setWebLifecycleState('active')` via CDP. Without this, the extension stalls until the user manually focuses the tab.
 - **Protocol timeouts ≠ task failure**: If `panel.evaluate()` times out during polling, the extension may still be working. Never resend without checking if the task is already in the conversation history. The duplicate guard handles this.
 
 ## Reading responses
@@ -188,10 +203,11 @@ Two complementary methods, both shown in the code above:
 - Assistant messages: `.claude-response`
 - Walk children of `.flex-1.flex.flex-col.px-4` in order to get the conversation sequence
 
-**CDP Network interception** — raw API JSON:
+**CDP Network interception** — raw API events:
 - The extension calls `https://api.anthropic.com/v1/messages?beta=true` for each turn
 - Listen on `Network.requestWillBeSent` + `Network.loadingFinished`, then `Network.getResponseBody`
-- Responses include `stop_reason`, `usage`, tool call results — everything the DOM doesn't show
+- Responses are SSE streams (`event: ...` / `data: {...}`), not plain JSON. Parse by splitting on `\n\n` and extracting `data:` lines.
+- Key event types: `message_start` (model, id), `content_block_start` (tool calls), `message_delta` (stop_reason, usage)
 - Filter out title-generation calls (Haiku, max_tokens=128)
 
 Use DOM for the final answer text. Use network interception when you need to know *why* the extension stopped (error vs completion vs tool use) or what it did between turns.
