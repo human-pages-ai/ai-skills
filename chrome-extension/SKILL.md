@@ -83,11 +83,37 @@ if (!panel) {
   await new Promise(r => setTimeout(r, 3000));
 }
 
+// Set up CDP network interception for structured API responses
+const client = await panel.createCDPSession();
+await client.send('Network.enable');
+
+const apiResponses = [];
+const pendingRequests = new Map();
+
+client.on('Network.requestWillBeSent', (params) => {
+  if (params.request.url.includes('api.anthropic.com/v1/messages')) {
+    const body = JSON.parse(params.request.postData || '{}');
+    if (body.max_tokens > 128) { // skip title-generation calls
+      pendingRequests.set(params.requestId, { model: body.model, messageCount: body.messages?.length });
+    }
+  }
+});
+
+client.on('Network.loadingFinished', async (params) => {
+  if (pendingRequests.has(params.requestId)) {
+    try {
+      const resp = await client.send('Network.getResponseBody', { requestId: params.requestId });
+      apiResponses.push(JSON.parse(resp.body));
+    } catch(e) {}
+    pendingRequests.delete(params.requestId);
+  }
+});
+
 // Send a task (with duplicate guard)
 const task = 'YOUR TASK HERE';
 const alreadySent = await panel.evaluate((t) => {
-  const msgs = document.querySelectorAll('[data-testid="user-message"], .font-user-message');
-  for (const m of msgs) {
+  const userBubbles = document.querySelectorAll('.flex.justify-end.group .bg-bg-300');
+  for (const m of userBubbles) {
     if (m.innerText.trim().substring(0, 80) === t.substring(0, 80)) return true;
   }
   return false;
@@ -107,18 +133,38 @@ if (alreadySent) {
   });
 }
 
-// Wait for response (poll until stable)
-let prev = '';
-for (let i = 0; i < 40; i++) {
+// Wait for completion (poll Stop button + DOM stability)
+let prevText = '';
+for (let i = 0; i < 60; i++) {
   await new Promise(r => setTimeout(r, 3000));
-  const text = await panel.evaluate(() => document.body?.innerText);
   const running = await panel.evaluate(() => !!document.querySelector('button[aria-label="Stop"]'));
-  if (!running && text.length > 300 && text === prev) break;
-  prev = text;
+  const text = await panel.evaluate(() => {
+    const msgs = document.querySelectorAll('.claude-response');
+    return msgs.length ? msgs[msgs.length - 1].innerText : '';
+  });
+  if (!running && text.length > 20 && text === prevText) break;
+  prevText = text;
 }
 
-const response = await panel.evaluate(() => document.body?.innerText);
-console.log(response);
+// Read structured conversation
+const conversation = await panel.evaluate(() => {
+  const messages = [];
+  const container = document.querySelector('.flex-1.flex.flex-col.px-4');
+  if (!container) return messages;
+  for (const child of container.children) {
+    const userBubble = child.querySelector('.bg-bg-300');
+    if (userBubble) { messages.push({ role: 'user', text: userBubble.innerText.trim() }); continue; }
+    const claudeResp = child.querySelector('.claude-response');
+    if (claudeResp) { messages.push({ role: 'assistant', text: claudeResp.innerText.trim() }); continue; }
+  }
+  return messages;
+});
+
+// apiResponses has raw API JSON (stop_reason, usage, tool calls)
+// conversation has the clean per-message text from the DOM
+console.log(JSON.stringify({ conversation, apiResponses }, null, 2));
+
+await client.detach();
 await browser.disconnect();
 ```
 
@@ -131,8 +177,24 @@ await browser.disconnect();
 - **tabId is required**: Without it in the URL, the extension loads but can't call the API.
 - **Reuse the panel**: Check for an existing sidepanel page before opening a new one.
 - **The extension browses in real tabs**: It opens and navigates Chrome tabs. The user's browser is actively used.
-- **Response polling**: Check for the Stop button disappearing + text stabilizing to know when it's done.
-- **Protocol timeouts ≠ task failure**: If `panel.evaluate()` times out during polling, the extension may still be working. Never resend without checking if the task is already in the conversation history. The duplicate guard in the code above handles this.
+- **Protocol timeouts ≠ task failure**: If `panel.evaluate()` times out during polling, the extension may still be working. Never resend without checking if the task is already in the conversation history. The duplicate guard handles this.
+
+## Reading responses
+
+Two complementary methods, both shown in the code above:
+
+**DOM extraction** — structured conversation by role:
+- User messages: `.flex.justify-end.group .bg-bg-300` (the chat bubble)
+- Assistant messages: `.claude-response`
+- Walk children of `.flex-1.flex.flex-col.px-4` in order to get the conversation sequence
+
+**CDP Network interception** — raw API JSON:
+- The extension calls `https://api.anthropic.com/v1/messages?beta=true` for each turn
+- Listen on `Network.requestWillBeSent` + `Network.loadingFinished`, then `Network.getResponseBody`
+- Responses include `stop_reason`, `usage`, tool call results — everything the DOM doesn't show
+- Filter out title-generation calls (Haiku, max_tokens=128)
+
+Use DOM for the final answer text. Use network interception when you need to know *why* the extension stopped (error vs completion vs tool use) or what it did between turns.
 
 ## Why bind mount?
 
